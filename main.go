@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/ecdsa"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"manager/store"
+	"math/big"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,15 +20,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"modernc.org/ql"
 )
-
-/*
-#mac,ip,iface,in,out,total,first_date,last_date
-a0:ce:c8:b0:e8:eb,192.168.2.10,br-lan,0,0,0,12-10-2024_06:50:03,12-10-2024_06:50:03
-c6:f8:85:ce:62:d6,192.168.2.101,br-lan,0,0,0,12-10-2024_06:50:03,12-10-2024_06:50:03
-f2:64:c7:89:4c:42,192.168.2.110,br-lan,468,0,468,12-10-2024_06:50:03,12-10-2024_06:50:59
-*/
 
 type DeviceDetailEntry struct {
   MAC string `json:"mac"`
@@ -323,7 +324,7 @@ func NewDatabase() (*Database, error) {
   }, nil
 }
 
-func (db *Database) GetData() (*[][]DeviceDetailEntry, error) {
+func (db *Database) GetData() (*map[int64][]DeviceDetailEntry, error) {
   r, _, err := db.db.Run(db.ctx, "SELECT * FROM network_data")
   if err != nil {
     return nil, err
@@ -332,23 +333,8 @@ func (db *Database) GetData() (*[][]DeviceDetailEntry, error) {
   rows, err := r[0].Rows(-1, 0)
   if err != nil {
     return nil, err
-  }
-
-  var size int64 = 0
-  var minimum int64 = 0
-  for _, v := range rows {
-    if val, ok  := v[0].(int); ok {
-      size = max(size, int64(val))
-      minimum = min(minimum, int64(val))
-    } else if val, ok := v[0].(int64); ok {
-      size = max(size, val)
-      minimum = min(minimum, val)
-    } else {
-      return nil, errors.New(fmt.Sprintf("entry_id is not an int or int64: %v", v[0]))
-    }
-  }
-
-  data := make([][]DeviceDetailEntry, size - minimum + 1)
+  } 
+  data := make(map[int64][]DeviceDetailEntry)
 
   for _, v := range rows {
     entry, err := DeviceDetailEntryFromRowInterface(v[1:])
@@ -365,7 +351,7 @@ func (db *Database) GetData() (*[][]DeviceDetailEntry, error) {
       return nil, errors.New(fmt.Sprintf("2 entry_id is not an int or int64: %v", v[0]))
     }
     
-    data[id - minimum] = append(data[id - minimum], *entry)
+    data[id] = append(data[id], *entry)
   } 
 
   return &data, nil
@@ -442,12 +428,16 @@ func (b *Backend) handler(w http.ResponseWriter, r *http.Request) {
   if err != nil {
     log.Printf("error getting data: %v", err)
   }
-  json, err := json.Marshal(*d)
+  j, err := json.Marshal(*d)
   if err != nil {
     w.WriteHeader(http.StatusInternalServerError)
     return
   }
-  w.Write(json)
+  w.Header().Set("Content-Type", "application/json")
+  w.Header().Set("Content-Length", fmt.Sprintf("%d", len(j)))
+  w.Header().Set("Access-Control-Allow-Origin", "*")
+  w.WriteHeader(http.StatusOK)
+  w.Write(j)
 }
 
 func (b *Backend) start() (error) {
@@ -470,11 +460,61 @@ var backend *Backend
 
 type Reporter struct {
   threshold float64
+
+  blockchain *store.Store
+  opts *bind.TransactOpts
 }
 
 func NewReporter() (*Reporter, error) {
+  bc, err := ethclient.Dial("http://192.168.2.145:7545")
+  if err != nil {
+    return nil, err
+  } 
+
+  privateKey, err := crypto.HexToECDSA("c65c8be273db3bee1a55ae8f267bba4c193ea3435e9e9610d812c62a34592bc1")
+  if err != nil {
+    return nil, err
+  }
+
+  publicKey := privateKey.Public()
+  publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+  if !ok {
+    return nil, errors.New("error casting public key to ECDSA")
+  }
+
+  fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
+
+  _, err = bc.PendingNonceAt(context.Background(), fromAddress)
+  if err != nil {
+    log.Fatal(err)
+  }
+
+  gasPrice, err := bc.SuggestGasPrice(context.Background())
+  if err != nil {
+    log.Fatal(err)
+  }
+
+  auth, err := bind.NewKeyedTransactorWithChainID(privateKey, big.NewInt(1337))
+  if err != nil {
+    return nil, err
+  }
+
+  auth.Nonce = nil
+  auth.Value = big.NewInt(0)     // in wei
+  auth.GasLimit = uint64(5000000) // in units
+  auth.GasPrice = gasPrice
+
+  contractAddr := common.HexToAddress("0x8c4C0114C20bbf16B3bD61CA0E0179E80E4c3454")
+
+  instance, err := store.NewStore(contractAddr, bc)
+  if err != nil {
+    return nil, err
+  }
+
   r := &Reporter{
-    threshold: 0.5,
+    threshold: 0.5, // this should be determined by the prompt as well
+    blockchain: instance,
+    opts: auth,
   }
 
   go r.ConsumeTrafficAnalysisResults()
@@ -482,11 +522,38 @@ func NewReporter() (*Reporter, error) {
   return r, nil
 }
 
+func (r *Reporter) updateRanking(mac string, networkEloRanking uint16, isAbuser bool) (error) { 
+  _, err := r.blockchain.UpdateRanking(r.opts, mac, networkEloRanking, isAbuser)
+  if err != nil {
+    return err
+  }
+
+  i, err := r.blockchain.GetRanking(nil, mac)
+  if err != nil {
+    return err
+  }
+
+  log.Printf("[reporter] rank: %v", i)
+  return nil
+}
+
 func (r *Reporter) ConsumeTrafficAnalysisResults() {
   for {
     results := <- trafficAnalyzer.analysisResultsChan
 
+    isAbuser := func() (bool) {
+      if results.abuserRating > r.threshold {
+        return true
+      }
+
+      return false
+    }()
+
     // report to the blockchain here
+    err := r.updateRanking(results.MAC, 1000, isAbuser)
+    if err != nil {
+      log.Printf("[reporter] failed to report to blockchain: %v", err)
+    }
 
     // report to network manager here
 
