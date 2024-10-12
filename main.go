@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/csv"
 	"errors"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+  _ "github.com/mattn/go-sqlite3"
 )
 
 /*
@@ -27,11 +30,11 @@ type DeviceDetailEntry struct {
   In int64
   Out int64
   Total int64
-  FirstDate time.Time
-  LastDate time.Time
+  FirstDateUnix int64
+  LastDateUnix int64
 }
 
-func parseDetailDate(s string) (*time.Time, error) {
+func parseDetailDate(s string) (*int64, error) {
   sp := strings.Split(s, "_")
   date := sp[0]
   timeg := sp[1]
@@ -74,7 +77,7 @@ func parseDetailDate(s string) (*time.Time, error) {
     return nil, err
   }
 
-  t := time.Date(yearI, time.Month(monthI), dayI, hoursI, minsI, secI, 0, time.Local)
+  t := time.Date(yearI, time.Month(monthI), dayI, hoursI, minsI, secI, 0, time.Local).Unix()
   return &t, nil
 }
 
@@ -115,8 +118,8 @@ func DeviceDetailEntryFromRow(row []string) (*DeviceDetailEntry, error) {
     In: in,
     Out: out,
     Total: tot,
-    FirstDate: *firstDate,
-    LastDate: *lastDate,
+    FirstDateUnix: *firstDate,
+    LastDateUnix: *lastDate,
   }, nil
 }
 
@@ -231,7 +234,75 @@ func NewNetworkManager() (*NetworkManager) {
 
 var networkManager *NetworkManager
 
+type Database struct {
+  db *sql.DB
+
+  // how many dumps do we want to keep in the DB at once (anything older will be purged to save space)
+  dataFrameSize int
+  currEntryID int64
+}
+
+func NewDatabase() (*Database, error) {
+  // read in the last entry id from db
+  frameSize := 120
+  file := "db.db"
+  driver := "sqlite3"
+
+  tableCreateCmd := `
+  CREATE TABLE IF NOT EXISTS network_data (
+    entry_id INTEGER NOT NULL,
+    mac TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    interface TEXT NOT NULL,
+    in INTEGER NOT NULL,
+    out INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    first_date_unix INTEGER NOT NULL,
+    last_date_unix INTEGER NOT NULL,
+    PRIMARY KEY (entry_id, mac)
+  );
+  `
+
+  db, err := sql.Open(driver, file)
+  if err != nil {
+    return nil, err
+  }
+  if _, err := db.Exec(tableCreateCmd); err != nil {
+    return nil, err
+  }
+
+  r := db.QueryRow("SELECT MAX(entry_id) FROM network_date")
+  if r.Err() != nil {
+    return nil, err
+  }
+  var currEntryID int64
+  err = r.Scan(&currEntryID)
+  if err != nil {
+    return nil, err
+  }
+  return &Database{
+    db: db,
+    dataFrameSize: frameSize,
+    currEntryID: max(currEntryID, 0),
+  }, nil
+}
+
+func InsertDeviceNetworkData(entries []DeviceDetailEntry) (error) {
+  // insert new data
+
+  // drop data older than
+  return nil
+}
+
+var database *Database
+
 func main() {
+  database, err := NewDatabase()
+  if err != nil {
+    log.Panicf("error initializing db: %v", err)
+  }
+  log.Printf("currEntryID: %v", database.currEntryID)
+
   networkManager = NewNetworkManager()
   networkManager.start()
 }
