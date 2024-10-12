@@ -153,6 +153,8 @@ type NetworkManager struct {
   networkDetailDumperGroup sync.WaitGroup
   networkDumpInterval time.Duration
 
+  networkDumpChan chan []DeviceDetailEntry
+
   kickChan chan string
   kickMutex sync.Mutex
 }
@@ -220,13 +222,16 @@ func (rm *NetworkManager) dump() (error) {
     entries = append(entries, *d) 
   }
 
+  log.Printf("[network] took snapshot: %v", entries)
+
   // write to db
   err = database.InsertDeviceNetworkData(entries)
   if err != nil {
     return err
   }
 
-  // update last.db
+  // publish
+  rm.networkDumpChan <- entries
 
   return nil
 }
@@ -239,6 +244,8 @@ func (rm *NetworkManager) listen() {
     if err != nil {
       log.Printf("error kicking device (%v): %v", mac, err)
     }
+
+    log.Printf("[network] kicked %v", mac)
   }
 }
 
@@ -260,6 +267,7 @@ func (nm *NetworkManager) start() {
 func NewNetworkManager() (*NetworkManager) {
   return &NetworkManager{
     networkDumpInterval: time.Second * 3,
+    networkDumpChan: make(chan []DeviceDetailEntry),
     kickChan: make(chan string),
   }
 }
@@ -360,8 +368,6 @@ func (db *Database) GetData() (*[][]DeviceDetailEntry, error) {
     data[id - minimum] = append(data[id - minimum], *entry)
   } 
 
-  log.Printf("data: %v", rows)
-
   return &data, nil
 }
 
@@ -390,7 +396,7 @@ func (db *Database) InsertDeviceNetworkData(entries []DeviceDetailEntry) (error)
     return errors.New(fmt.Sprintf("invalid response for entry_id: %v", fr))
   }
 
-  log.Printf("inserting for id: %v", id)
+  log.Printf("[database] inserting id: %v", id)
 
   var buffer bytes.Buffer
   buffer.WriteString("BEGIN TRANSACTION;\n")
@@ -462,20 +468,103 @@ func NewBackend() (*Backend, error) {
 
 var backend *Backend
 
+type Reporter struct {
+  threshold float64
+}
+
+func NewReporter() (*Reporter, error) {
+  r := &Reporter{
+    threshold: 0.5,
+  }
+
+  go r.ConsumeTrafficAnalysisResults()
+
+  return r, nil
+}
+
+func (r *Reporter) ConsumeTrafficAnalysisResults() {
+  for {
+    results := <- trafficAnalyzer.analysisResultsChan
+
+    // report to the blockchain here
+
+    // report to network manager here
+
+    log.Printf("[reporter] %v", results)
+  } 
+}
+
+var reporter *Reporter
+
+type TrafficAnalysisResults struct {
+  MAC string
+  abuserRating float64
+}
+
+type TrafficAnalyzer struct {
+  analysisResultsChan chan TrafficAnalysisResults
+}
+
+func NewTrafficAnalyzer() (*TrafficAnalyzer, error) {
+  ta := &TrafficAnalyzer{
+    analysisResultsChan: make(chan TrafficAnalysisResults),
+  }
+
+  go ta.ConsumeNetworkDump()
+
+  return ta, nil
+}
+
+func (ta *TrafficAnalyzer) ConsumeNetworkDump() {
+  for {
+    entries := <- networkManager.networkDumpChan
+
+    log.Printf("[traffic-analyzer] received network snapshot %v", entries)
+
+    // run analysis here to calc abuser rating
+
+    for _, v := range entries {
+      ta.analysisResultsChan <- TrafficAnalysisResults{
+        MAC: v.MAC,
+        abuserRating: 0.1,
+      }
+    } 
+  }
+}
+
+var trafficAnalyzer *TrafficAnalyzer
+
 func main() {
   var err error
   database, err = NewDatabase()
   if err != nil {
     log.Panicf("error initializing db: %v", err)
+    return
   }
 
   networkManager = NewNetworkManager()
-  go networkManager.start()
+  go networkManager.start() 
+
+  trafficAnalyzer, err = NewTrafficAnalyzer()
+  if err != nil {
+    log.Printf("failed to start traffic analyzer: %v", err)
+    return
+  }
+
+  reporter, err = NewReporter()
+  if err != nil {
+    log.Printf("failed to start reporter: %v", err)
+    return
+  }
 
   backend, err = NewBackend()
   err = backend.start()
   if err != nil {
     log.Printf("failed to start backend: %v", err)
+    return
   }
 }
 
+func handleKeyboardInterrupt() {
+  // nicely close db here
+}
