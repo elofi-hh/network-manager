@@ -1,11 +1,14 @@
 package main
 
 import (
-	"database/sql"
+	"bytes"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
@@ -13,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-  _ "github.com/mattn/go-sqlite3"
+	"modernc.org/ql"
 )
 
 /*
@@ -24,17 +27,26 @@ f2:64:c7:89:4c:42,192.168.2.110,br-lan,468,0,468,12-10-2024_06:50:03,12-10-2024_
 */
 
 type DeviceDetailEntry struct {
-  MAC string
-  IP string
-  Interface string
-  In int64
-  Out int64
-  Total int64
-  FirstDateUnix int64
-  LastDateUnix int64
+  MAC string `json:"mac"`
+  IP string `json:"ip"`
+  Interface string `json:"interface"`
+  In int64 `json:"data_in"`
+  Out int64 `json:"data_out"`
+  Total int64 `json:"data_total"`
+  FirstDateUnix int64 `json:"first_date_unix"`
+  LastDateUnix int64 `json:"last_date_unix"`
 }
 
 func parseDetailDate(s string) (*int64, error) {
+  if !strings.Contains(s, "_") {
+    t, err := strconv.ParseInt(s, 10, 64)
+    if err != nil {
+      return nil, errors.New(fmt.Sprintf("invalid time format: %v", s))
+    }
+
+    return &t, nil
+  }
+
   sp := strings.Split(s, "_")
   date := sp[0]
   timeg := sp[1]
@@ -79,6 +91,20 @@ func parseDetailDate(s string) (*int64, error) {
 
   t := time.Date(yearI, time.Month(monthI), dayI, hoursI, minsI, secI, 0, time.Local).Unix()
   return &t, nil
+}
+
+func DeviceDetailEntryFromRowInterface(row []interface{}) (*DeviceDetailEntry, error) {
+  if len(row) != 8 {
+    return nil, errors.New("row is not of length 8")
+  }
+
+  var stringRow [8]string
+
+  for i, v := range row { 
+    stringRow[i] = fmt.Sprintf("%v", v)
+  }
+
+  return DeviceDetailEntryFromRow(stringRow[:])
 }
 
 func DeviceDetailEntryFromRow(row []string) (*DeviceDetailEntry, error) {
@@ -175,6 +201,8 @@ func (rm *NetworkManager) dump() (error) {
     return err
   }
 
+  entries := []DeviceDetailEntry{}
+
   for {
     row, err := r.Read()
     if err == io.EOF {
@@ -189,10 +217,14 @@ func (rm *NetworkManager) dump() (error) {
       return err
     }
 
-    log.Printf("%v", d)
+    entries = append(entries, *d) 
   }
 
-  // write to sqlite
+  // write to db
+  err = database.InsertDeviceNetworkData(entries)
+  if err != nil {
+    return err
+  }
 
   // update last.db
 
@@ -227,7 +259,7 @@ func (nm *NetworkManager) start() {
 
 func NewNetworkManager() (*NetworkManager) {
   return &NetworkManager{
-    networkDumpInterval: time.Second * 5,
+    networkDumpInterval: time.Second * 3,
     kickChan: make(chan string),
   }
 }
@@ -235,75 +267,215 @@ func NewNetworkManager() (*NetworkManager) {
 var networkManager *NetworkManager
 
 type Database struct {
-  db *sql.DB
+  db *ql.DB
+  ctx *ql.TCtx
 
   // how many dumps do we want to keep in the DB at once (anything older will be purged to save space)
   dataFrameSize int
-  currEntryID int64
 }
 
 func NewDatabase() (*Database, error) {
   // read in the last entry id from db
   frameSize := 120
   file := "db.db"
-  driver := "sqlite3"
 
   tableCreateCmd := `
+  BEGIN TRANSACTION;
   CREATE TABLE IF NOT EXISTS network_data (
-    entry_id INTEGER NOT NULL,
-    mac TEXT NOT NULL,
-    ip TEXT NOT NULL,
-    interface TEXT NOT NULL,
-    in INTEGER NOT NULL,
-    out INTEGER NOT NULL,
-    total INTEGER NOT NULL,
-    first_date_unix INTEGER NOT NULL,
-    last_date_unix INTEGER NOT NULL,
-    PRIMARY KEY (entry_id, mac)
+    entry_id int64,
+    mac string,
+    ip string,
+    interface string,
+    data_int int64,
+    data_out int64,
+    data_total int64,
+    first_date_unix int64,
+    last_date_unix int64,
   );
+  CREATE UNIQUE INDEX IF NOT EXISTS xnetwork_data ON network_data (entry_id, mac);
+  COMMIT;
   `
 
-  db, err := sql.Open(driver, file)
+  db, err := ql.OpenFile(file, &ql.Options{
+    CanCreate: true,
+  })
   if err != nil {
-    return nil, err
-  }
-  if _, err := db.Exec(tableCreateCmd); err != nil {
     return nil, err
   }
 
-  r := db.QueryRow("SELECT MAX(entry_id) FROM network_date")
-  if r.Err() != nil {
+  ctx := ql.NewRWCtx()
+
+  if _, _, err := db.Run(ctx, tableCreateCmd); err != nil {
     return nil, err
-  }
-  var currEntryID int64
-  err = r.Scan(&currEntryID)
-  if err != nil {
-    return nil, err
-  }
+  } 
   return &Database{
     db: db,
+    ctx: ctx,
     dataFrameSize: frameSize,
-    currEntryID: max(currEntryID, 0),
   }, nil
 }
 
-func InsertDeviceNetworkData(entries []DeviceDetailEntry) (error) {
+func (db *Database) GetData() (*[][]DeviceDetailEntry, error) {
+  r, _, err := db.db.Run(db.ctx, "SELECT * FROM network_data")
+  if err != nil {
+    return nil, err
+  }
+
+  rows, err := r[0].Rows(-1, 0)
+  if err != nil {
+    return nil, err
+  }
+
+  var size int64 = 0
+  var minimum int64 = 0
+  for _, v := range rows {
+    if val, ok  := v[0].(int); ok {
+      size = max(size, int64(val))
+      minimum = min(minimum, int64(val))
+    } else if val, ok := v[0].(int64); ok {
+      size = max(size, val)
+      minimum = min(minimum, val)
+    } else {
+      return nil, errors.New(fmt.Sprintf("entry_id is not an int or int64: %v", v[0]))
+    }
+  }
+
+  data := make([][]DeviceDetailEntry, size - minimum + 1)
+
+  for _, v := range rows {
+    entry, err := DeviceDetailEntryFromRowInterface(v[1:])
+    if err != nil {
+      return nil, err
+    }
+
+    var id int64
+    if val, ok  := v[0].(int); ok {
+      id = int64(val)
+    } else if val, ok := v[0].(int64); ok {
+      id = val
+    } else {
+      return nil, errors.New(fmt.Sprintf("2 entry_id is not an int or int64: %v", v[0]))
+    }
+    
+    data[id - minimum] = append(data[id - minimum], *entry)
+  } 
+
+  log.Printf("data: %v", rows)
+
+  return &data, nil
+}
+
+func (db *Database) InsertDeviceNetworkData(entries []DeviceDetailEntry) (error) {
   // insert new data
+  r, _, err := db.db.Run(db.ctx, "SELECT max(entry_id) FROM network_data")
+  if err != nil {
+    return err
+  }
+
+  fr, err := r[0].FirstRow()
+  if err != nil {
+    return err
+  }
+
+  val := fr[0]
+
+  var id int64
+  if val == nil {
+    id = 0
+  } else if v, ok := val.(int); ok {
+    id = int64(v) + 1
+  } else if v, ok := val.(int64); ok {
+    id = v + 1
+  } else {
+    return errors.New(fmt.Sprintf("invalid response for entry_id: %v", fr))
+  }
+
+  log.Printf("inserting for id: %v", id)
+
+  var buffer bytes.Buffer
+  buffer.WriteString("BEGIN TRANSACTION;\n")
+  buffer.WriteString(`INSERT INTO network_data VALUES`)
+  for i, entry := range entries {
+    if i != 0 {
+      buffer.WriteString(`,`)
+    }
+
+    buffer.WriteString(fmt.Sprintf(` (%v, "%v", "%v", "%v", %v, %v, %v, %v, %v)`, id, entry.MAC, entry.IP, entry.Interface, entry.In, entry.Out, entry.Total, entry.FirstDateUnix, entry.LastDateUnix))
+  }
+  buffer.WriteString(";\n")
+  buffer.WriteString(`COMMIT;`)
+  _, _, err = db.db.Run(db.ctx, buffer.String())
+  if err != nil {
+    return err
+  }
+
+  //log.Printf("successfully inserted %v", entries)
+
+  old := id - int64(db.dataFrameSize)
 
   // drop data older than
+  _, _, err = db.db.Run(db.ctx, fmt.Sprintf(`
+    BEGIN TRANSACTION;
+      DELETE FROM network_data WHERE entry_id < %v;
+    COMMIT;
+    `, old))
+  if err != nil {
+    return err
+  }
+
+  //log.Printf("successfully purged old data (before %v)", old)
   return nil
 }
 
 var database *Database
 
+type Backend struct {}
+
+func (b *Backend) handler(w http.ResponseWriter, r *http.Request) {
+  d, err := database.GetData()
+  if err != nil {
+    log.Printf("error getting data: %v", err)
+  }
+  json, err := json.Marshal(*d)
+  if err != nil {
+    w.WriteHeader(http.StatusInternalServerError)
+    return
+  }
+  w.Write(json)
+}
+
+func (b *Backend) start() (error) {
+  r := http.NewServeMux()
+  r.HandleFunc("/", b.handler)
+
+  err := http.ListenAndServe(":8080", r)
+  if err != nil {
+    return err
+  }
+
+  return nil
+}
+
+func NewBackend() (*Backend, error) {
+  return &Backend{}, nil
+}
+
+var backend *Backend
+
 func main() {
-  database, err := NewDatabase()
+  var err error
+  database, err = NewDatabase()
   if err != nil {
     log.Panicf("error initializing db: %v", err)
   }
-  log.Printf("currEntryID: %v", database.currEntryID)
 
   networkManager = NewNetworkManager()
-  networkManager.start()
+  go networkManager.start()
+
+  backend, err = NewBackend()
+  err = backend.start()
+  if err != nil {
+    log.Printf("failed to start backend: %v", err)
+  }
 }
 
