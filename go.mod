@@ -2,4 +2,10 @@ module manager
 
 go 1.21.0
 
-require gopkg.in/zeromq/goczmq.v4 v4.1.0 // indirect
+require (
+	github.com/Microsoft/go-winio v0.6.1 // indirect
+	github.com/james-barrow/golang-ipc v1.2.4 // indirect
+	golang.org/x/mod v0.10.0 // indirect
+	golang.org/x/sys v0.8.0 // indirect
+	golang.org/x/tools v0.9.1 // indirect
+)
