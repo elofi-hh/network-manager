@@ -24,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/gammazero/deque"
 	"modernc.org/ql"
 )
 
@@ -162,24 +163,38 @@ type NetworkManager struct {
 
 func (rm *NetworkManager) kickDevice(mac string) (error) {
   // not 100% sure if we need to lock this but just incase for now
-  rm.kickMutex.Lock()
-  ipsetCmd := exec.Command("ipset", "add", "mac-ban", mac)
-  err := ipsetCmd.Run()
+  log.Printf("done -1")
+  ipsetCreateCmd := exec.Command("ipset", "create", "mac-ban", "hash:mac", "-!")
+  err := ipsetCreateCmd.Run()
   if err != nil {
     return err
   }
+
+  log.Printf("done 0")
+
+  ipsetCmd := exec.Command("ipset", "add", "mac-ban", mac)
+  err = ipsetCmd.Run()
+  if err != nil {
+    return err
+  }
+
+  log.Printf("done 1")
+
   cmd := exec.Command("hostapd_cli", "disassociate", mac)
   err = cmd.Run()
   if err != nil {
     return err
   }
 
+  log.Printf("done 2")
+
   cmd = exec.Command("hostapd_cli", "deauthenticate", mac)
   err = cmd.Run()
   if err != nil {
     return err
   }
-  rm.kickMutex.Unlock()
+
+  log.Printf("done 4")
   return nil
 }
 
@@ -232,15 +247,16 @@ func (rm *NetworkManager) dump() (error) {
   }
 
   // publish
+  log.Printf("not chillin")
   rm.networkDumpChan <- entries
-
+  log.Printf("chillin")
   return nil
 }
 
 func (rm *NetworkManager) listen() {
   for {
     mac := <- rm.kickChan
-
+    networkManager.kickChan <- mac
     err := rm.kickDevice(mac)
     if err != nil {
       log.Printf("error kicking device (%v): %v", mac, err)
@@ -286,7 +302,7 @@ type Database struct {
 func NewDatabase() (*Database, error) {
   // read in the last entry id from db
   frameSize := 120
-  file := "db.db"
+  file := "bruh1.db"
 
   tableCreateCmd := `
   BEGIN TRANSACTION;
@@ -302,6 +318,13 @@ func NewDatabase() (*Database, error) {
     last_date_unix int64,
   );
   CREATE UNIQUE INDEX IF NOT EXISTS xnetwork_data ON network_data (entry_id, mac);
+  CREATE TABLE IF NOT EXISTS prompt (
+    id int,
+    prompt string,
+    threshold int64,
+    window int64,
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS xprompt ON prompt (id);
   COMMIT;
   `
 
@@ -309,12 +332,14 @@ func NewDatabase() (*Database, error) {
     CanCreate: true,
   })
   if err != nil {
+    log.Printf("bruh")
     return nil, err
   }
 
   ctx := ql.NewRWCtx()
 
   if _, _, err := db.Run(ctx, tableCreateCmd); err != nil {
+    log.Printf("fuck")
     return nil, err
   } 
   return &Database{
@@ -322,6 +347,111 @@ func NewDatabase() (*Database, error) {
     ctx: ctx,
     dataFrameSize: frameSize,
   }, nil
+}
+
+func (db *Database) GetOnboarded() (*bool, error) {
+  r, _, err := db.db.Run(db.ctx, "SELECT * FROM prompt")
+  if err != nil {
+    return nil, err
+  }
+
+  rows, err := r[0].Rows(-1, 0)
+  if err != nil {
+    return nil, err
+  }
+
+  a := len(rows) == 1
+
+  fmt.Printf("prompt: %v", rows)
+  return &a, nil
+}
+
+type PromptDetails struct {
+  prompt string
+  threshold int64
+  window int64
+}
+
+func (db *Database) GetPrompt() (*PromptDetails, error) {
+  r, _, err := db.db.Run(db.ctx, `SELECT * FROM prompt WHERE id = 1`)
+  if err != nil {
+    return nil, err
+  }
+
+  rows, err := r[0].Rows(-1, 0)
+  if err != nil {
+    return nil, err
+  }
+
+  if len(rows) == 0 {
+    return nil, errors.New("no prompt was set")
+  }
+
+  prompt := ""
+
+  var threshold int64 = 30000
+  var window int64 = 10
+
+  if v, ok := rows[0][1].(string); ok {
+    prompt = v
+  }
+
+  if v, ok := rows[0][2].(int); ok {
+     threshold = int64(v)
+  } else if v, ok := rows[0][2].(int64); ok {
+    threshold = v
+  }
+
+  if v, ok := rows[0][3].(int); ok {
+    window = int64(v)
+  } else if v, ok := rows[0][3].(int64); ok {
+    window = v
+  }
+
+  p := &PromptDetails{
+    prompt: prompt,
+    threshold: threshold,
+    window: window,
+  }
+  return p, nil
+}
+
+func (db *Database) SetPrompt(prompt string, threshold int64, window int64) (error) {
+  // the reason we cant do a simple ON CONFLICT here is because we arent using regular SQL. its some weird sql-like language so we can avoid using C compilation
+
+  r, _, err := db.db.Run(db.ctx, `SELECT * FROM prompt WHERE id = 1`)
+  if err != nil {
+    return err
+  }
+
+  rows, err := r[0].Rows(-1, 0)
+  if err != nil {
+    return err
+  }
+
+  a := len(rows) == 1
+
+  var buffer bytes.Buffer
+  buffer.WriteString(`BEGIN TRANSACTION;`)
+
+  if a {
+    buffer.WriteString(`DELETE FROM prompt WHERE id = 1;`)
+  }
+
+  buffer.WriteString(fmt.Sprintf(`INSERT INTO prompt (id, prompt, threshold, window) VALUES (1, "%v", %v, %v);`, prompt, threshold, window))
+
+  buffer.WriteString(`COMMIT;`)
+  _, _, err = db.db.Run(db.ctx, buffer.String())
+  return err
+}
+
+func (db *Database) ResetOnboarded() (error) {
+  _, _, err := db.db.Run(db.ctx, `
+    BEGIN TRANSACTION;
+      DELETE FROM prompt WHERE id = 1;
+    COMMIT;
+  `)
+  return err
 }
 
 func (db *Database) GetData() (*map[int64][]DeviceDetailEntry, error) {
@@ -401,7 +531,7 @@ func (db *Database) InsertDeviceNetworkData(entries []DeviceDetailEntry) (error)
     return err
   }
 
-  //log.Printf("successfully inserted %v", entries)
+  //log.Printf("[database] successfully inserted id: %v", id)
 
   old := id - int64(db.dataFrameSize)
 
@@ -440,9 +570,74 @@ func (b *Backend) handler(w http.ResponseWriter, r *http.Request) {
   w.Write(j)
 }
 
+func (b *Backend) CheckOnboardedHandler(w http.ResponseWriter, r *http.Request) {
+  d, err := database.GetOnboarded()
+  if err != nil {
+    log.Printf("error getting data: %v", err)
+  }
+  j, err := json.Marshal(*d)
+  if err != nil {
+    w.WriteHeader(http.StatusInternalServerError)
+    return
+  }
+  w.Header().Set("Content-Type", "application/json")
+  w.Header().Set("Content-Length", fmt.Sprintf("%d", len(j)))
+  w.Header().Set("Access-Control-Allow-Origin", "*")
+  w.WriteHeader(http.StatusOK)
+  w.Write(j)
+}
+
+type OnboardRequest struct {
+  Prompt string `json:"prompt"`
+  Threshold int64 `json:"threshold"`
+  Window int64 `json:"window"`
+}
+
+func (b *Backend) HandleOnboard(w http.ResponseWriter, r *http.Request) {
+  if r.Method == "DELETE" {
+    err := database.ResetOnboarded()
+    if err != nil {
+      w.WriteHeader(http.StatusInternalServerError)
+      return
+    }
+
+    w.WriteHeader(http.StatusOK)
+    return
+  }
+  by, err := io.ReadAll(r.Body)
+  if err != nil {
+    w.WriteHeader(http.StatusInternalServerError)
+    return
+  }
+  body := string(by)
+  if body == "" || r.Method != "POST" {
+    w.WriteHeader(http.StatusBadRequest)
+    return 
+  }
+
+  var req OnboardRequest
+
+  err = json.Unmarshal(by, &req)
+  if err != nil {
+    w.WriteHeader(http.StatusBadRequest)
+    return
+  }
+
+  err = database.SetPrompt(req.Prompt, req.Threshold, req.Window)
+  if err != nil {
+    log.Printf("error setting prompt: %v", err)
+    w.WriteHeader(http.StatusInternalServerError)
+    return
+  }
+  log.Printf("set prompt to: %v", body)
+  w.WriteHeader(http.StatusOK)
+}
+
 func (b *Backend) start() (error) {
   r := http.NewServeMux()
   r.HandleFunc("/", b.handler)
+  r.HandleFunc("/check_onboarded", b.CheckOnboardedHandler)
+  r.HandleFunc("/onboard", b.HandleOnboard)
 
   err := http.ListenAndServe(":8080", r)
   if err != nil {
@@ -522,7 +717,7 @@ func NewReporter() (*Reporter, error) {
   return r, nil
 }
 
-func (r *Reporter) updateRanking(mac string, networkEloRanking uint16, isAbuser bool) (error) { 
+func (r *Reporter) updateRanking(mac string, networkEloRanking uint16, isAbuser bool) (error) {
   _, err := r.blockchain.UpdateRanking(r.opts, mac, networkEloRanking, isAbuser)
   if err != nil {
     return err
@@ -533,14 +728,20 @@ func (r *Reporter) updateRanking(mac string, networkEloRanking uint16, isAbuser 
     return err
   }
 
+  if i < 800 {
+    networkManager.kickChan <- mac
+  }
+
   log.Printf("[reporter] rank: %v", i)
   return nil
 }
 
 func (r *Reporter) ConsumeTrafficAnalysisResults() {
   for {
+    log.Printf("waiting for analysis results")
     results := <- trafficAnalyzer.analysisResultsChan
 
+    log.Printf("start abuse check")
     isAbuser := func() (bool) {
       if results.abuserRating > r.threshold {
         return true
@@ -549,11 +750,15 @@ func (r *Reporter) ConsumeTrafficAnalysisResults() {
       return false
     }()
 
+    log.Printf("end abuse check")
+
     // report to the blockchain here
     err := r.updateRanking(results.MAC, 1000, isAbuser)
     if err != nil {
       log.Printf("[reporter] failed to report to blockchain: %v", err)
     }
+
+    log.Printf("end update ranking")
 
     // report to network manager here
 
@@ -570,11 +775,14 @@ type TrafficAnalysisResults struct {
 
 type TrafficAnalyzer struct {
   analysisResultsChan chan TrafficAnalysisResults
+
+  pastTrafficBuffer deque.Deque[[]DeviceDetailEntry]
 }
 
 func NewTrafficAnalyzer() (*TrafficAnalyzer, error) {
   ta := &TrafficAnalyzer{
     analysisResultsChan: make(chan TrafficAnalysisResults),
+    pastTrafficBuffer: deque.Deque[[]DeviceDetailEntry]{},
   }
 
   go ta.ConsumeNetworkDump()
@@ -584,18 +792,76 @@ func NewTrafficAnalyzer() (*TrafficAnalyzer, error) {
 
 func (ta *TrafficAnalyzer) ConsumeNetworkDump() {
   for {
+    log.Printf("waiting for dump")
     entries := <- networkManager.networkDumpChan
 
     log.Printf("[traffic-analyzer] received network snapshot %v", entries)
 
-    // run analysis here to calc abuser rating
+    ta.pastTrafficBuffer.PushFront(entries)
 
-    for _, v := range entries {
-      ta.analysisResultsChan <- TrafficAnalysisResults{
-        MAC: v.MAC,
-        abuserRating: 0.1,
+    prompt, err := database.GetPrompt()
+    if err == nil {
+      for {
+        if int64(ta.pastTrafficBuffer.Len()) <= prompt.window {
+          log.Printf("this 1")
+          break
+        }
+        ta.pastTrafficBuffer.PopBack()
       }
-    } 
+
+      m := ta.pastTrafficBuffer.Len()
+      i := 1
+
+      abuserTotal := map[string]int64{}
+
+      for {
+        if i >= m {
+          log.Printf("this 2")
+          break
+        }
+        // mapping every mac address to its total data use
+        curr := map[string]int64{}
+        for _, v := range ta.pastTrafficBuffer.At(i) {
+          curr[v.MAC] = v.Total
+        }
+
+        last := map[string]int64{}
+        for _, v := range ta.pastTrafficBuffer.At(i - 1) {
+          last[v.MAC] = v.Total
+        }
+
+        for mac, tot := range curr {
+          lastTot, ok := last[mac]
+          // if this is the first moment we have seen this device we can skip
+          if !ok {
+            log.Printf("this 2")
+            continue
+          }
+
+          if lastTot - tot > prompt.threshold {
+            abuserTotal[mac] += 1
+          }
+        }
+
+        i += 1
+      }
+
+      log.Printf("window: %v", prompt.window)
+      log.Printf("abuserTotals: %v", abuserTotal) 
+
+      for mac, total := range abuserTotal {
+        log.Printf("bruh ting %v", ta.analysisResultsChan)
+
+        // this is fuck
+        ta.analysisResultsChan <- TrafficAnalysisResults{
+          MAC: mac,
+          abuserRating: float64(total) / float64(prompt.window),
+        }
+        log.Printf("bruh idk")
+      }
+    } else {
+      log.Printf("error getting prompt: %v", err)
+    }
   }
 }
 
